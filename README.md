@@ -102,7 +102,8 @@ Tests run on SQLite in a temp directory — `go test ./...`, nothing to install.
 
 ## Relation to the core repo
 
-The Priompt server currently carries its own copy of this package
-(`internal/store`) so it stays buildable standalone; this repo is the
-importable library version. Sync changes between the two until core switches
-to importing this module.
+The Priompt server imports this module directly (as `priomptdb`) — there is
+one copy of the storage engine and this repo is it. During local development
+the server's `go.mod` points here with a `replace` directive; when this module
+is published under its public path, that directive is swapped for a normal
+`require`.
