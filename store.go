@@ -86,9 +86,15 @@ func Open(dsn string) (*Store, error) {
 			break
 		}
 	}
+	if d.dsn != nil {
+		dsn = d.dsn(dsn)
+	}
 	db, err := sql.Open(d.driver, dsn)
 	if err != nil {
 		return nil, err
+	}
+	if d.maxConns > 0 {
+		db.SetMaxOpenConns(d.maxConns)
 	}
 	version, err := migrate(db, d)
 	if err != nil {
@@ -234,12 +240,23 @@ type Commit struct {
 	CreatedAt   time.Time
 }
 
-// CommitHash is the commit identity: content plus lineage plus authorship. Two
-// commits with the same content but different parents are distinct nodes, which
-// is what lets history branch and reverts not collide with the original.
-func CommitHash(versionHash, parent, parent2, author, message string) string {
+// CommitHash is the commit identity: which prompt, plus content, plus lineage,
+// plus authorship. Two commits with the same content but different parents are
+// distinct nodes, which is what lets history branch and reverts not collide
+// with the original.
+//
+// The uri is part of the identity, and must be. Git gets this for free because
+// a commit names a tree and a tree encodes path -> blob: identical file content
+// shares a *blob* (safe, and deliberate dedup) while the commit still differs
+// by path. This store snapshots content inline with no tree layer, so leaving
+// the uri out collapsed the two: any two prompts with the same template, author
+// and message produced the same hash, the second INSERT hit ON CONFLICT DO
+// NOTHING and was dropped, and the surviving row kept the *first* prompt's uri.
+// The second prompt's branch then pointed at a commit that disowned it, which
+// corrupted its history (across org boundaries) and made rollback impossible.
+func CommitHash(uri, versionHash, parent, parent2, author, message string) string {
 	h := sha256.New()
-	for _, p := range []string{versionHash, parent, parent2, author, message} {
+	for _, p := range []string{uri, versionHash, parent, parent2, author, message} {
 		h.Write([]byte(p))
 		h.Write([]byte{0})
 	}
@@ -250,8 +267,20 @@ var ErrBranchNotFound = errors.New("branch not found")
 
 // tip returns the commit hash a branch points at, or ErrBranchNotFound.
 func (s *Store) tip(ctx context.Context, uri, branch string) (string, error) {
+	return scanTip(s.db.QueryRowContext(ctx, s.rebind(tipQuery), uri, branch))
+}
+
+// tipTx is tip read inside an open transaction, so the compare-and-swap in
+// commit can tell a genuine conflict from an idempotent re-commit.
+func (s *Store) tipTx(ctx context.Context, tx *sql.Tx, uri, branch string) (string, error) {
+	return scanTip(tx.QueryRowContext(ctx, s.rebind(tipQuery), uri, branch))
+}
+
+const tipQuery = `SELECT commit_hash FROM refs WHERE uri=? AND branch=?`
+
+func scanTip(row *sql.Row) (string, error) {
 	var h string
-	err := s.db.QueryRowContext(ctx, s.rebind(`SELECT commit_hash FROM refs WHERE uri=? AND branch=?`), uri, branch).Scan(&h)
+	err := row.Scan(&h)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrBranchNotFound
 	}
@@ -271,6 +300,13 @@ func (s *Store) Commit(ctx context.Context, uri, branch, template string, slots 
 	return s.commit(ctx, uri, branch, template, slots, parent, "", author, message)
 }
 
+// ErrConflict means the branch moved between reading its tip and advancing it —
+// someone else committed first. It is retryable: re-read the tip and reapply.
+var ErrConflict = errors.New("branch moved: concurrent update")
+
+// ErrAlreadyExists means the named branch is already present on this prompt.
+var ErrAlreadyExists = errors.New("branch already exists")
+
 // commit inserts a commit (with explicit parents) and moves branch to it, in one
 // transaction. Used by both Commit and Merge.
 func (s *Store) commit(ctx context.Context, uri, branch, template string, slots []string, parent, parent2, author, message string) (string, error) {
@@ -279,7 +315,7 @@ func (s *Store) commit(ctx context.Context, uri, branch, template string, slots 
 		return "", err
 	}
 	vh := Hash(template, slots)
-	hash := CommitHash(vh, parent, parent2, author, message)
+	hash := CommitHash(uri, vh, parent, parent2, author, message)
 	encT, encSlots := s.seal(template), s.seal(string(slotsJSON))
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -301,10 +337,43 @@ func (s *Store) commit(ctx context.Context, uri, branch, template string, slots 
 	if _, err := tx.ExecContext(ctx, s.rebind(ins), hash, uri, encT, encSlots, vh, p, p2, author, message, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return "", err
 	}
-	up := `INSERT INTO refs(uri,branch,commit_hash) VALUES(?,?,?)
-		ON CONFLICT(uri,branch) DO UPDATE SET commit_hash=excluded.commit_hash`
-	if _, err := tx.ExecContext(ctx, s.rebind(up), uri, branch, hash); err != nil {
+	// Advance the branch as a compare-and-swap against the parent we read, not a
+	// blind overwrite. Without the WHERE clause this was a lost update: several
+	// writers read the same tip, each built a commit pointing at it, and each
+	// overwrote the ref — every call returned success while only the last became
+	// reachable. The rest stayed in the commits table as orphans that Log, which
+	// walks first-parent, could never reach.
+	//
+	// This is the same discipline as a Git ref transaction (an update names the
+	// old oid and fails if it moved, which is what --force-with-lease exposes),
+	// etcd's compare-on-ModRevision, and a conditional write in DynamoDB. The
+	// caller gets ErrConflict and retries; nobody is told a write succeeded when
+	// it did not.
+	var res sql.Result
+	if parent == "" && parent2 == "" {
+		// Root commit: the branch must not exist yet. If another writer created
+		// it first, DO NOTHING leaves 0 rows and we report the conflict.
+		root := `INSERT INTO refs(uri,branch,commit_hash) VALUES(?,?,?)
+			ON CONFLICT(uri,branch) DO NOTHING`
+		res, err = tx.ExecContext(ctx, s.rebind(root), uri, branch, hash)
+	} else {
+		cas := `UPDATE refs SET commit_hash=? WHERE uri=? AND branch=? AND commit_hash=?`
+		res, err = tx.ExecContext(ctx, s.rebind(cas), hash, uri, branch, parent)
+	}
+	if err != nil {
 		return "", err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if n == 0 {
+		// Committing the identical node onto the tip it already points at is a
+		// no-op, not a conflict — keep Commit idempotent.
+		if cur, terr := s.tipTx(ctx, tx, uri, branch); terr == nil && cur == hash {
+			return hash, tx.Commit()
+		}
+		return "", ErrConflict
 	}
 	// The prompts table is the materialized tip of the trunk — the served HEAD.
 	// Keep it in sync whenever a commit (or merge) moves main, in the same tx.
@@ -323,8 +392,24 @@ func (s *Store) Branch(ctx context.Context, uri, name, from string) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, s.rebind(`INSERT INTO refs(uri,branch,commit_hash) VALUES(?,?,?)`), uri, name, src)
-	return err
+	// ON CONFLICT DO NOTHING rather than letting the unique index raise: the
+	// driver's own message ("UNIQUE constraint failed: refs.uri, refs.branch")
+	// used to reach the client verbatim as an INTERNAL error, which is both the
+	// wrong code for "already exists" and a disclosure of the schema.
+	res, err := s.db.ExecContext(ctx, s.rebind(
+		`INSERT INTO refs(uri,branch,commit_hash) VALUES(?,?,?) ON CONFLICT(uri,branch) DO NOTHING`),
+		uri, name, src)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrAlreadyExists
+	}
+	return nil
 }
 
 // Merge records a merge commit on into, with into's tip as first parent and from's

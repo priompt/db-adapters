@@ -1,6 +1,7 @@
 package priomptdb
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -20,6 +21,65 @@ import (
 // ciphertext and fail to decrypt. Vanishingly unlikely for prompt text; move the
 // marker to its own column if it ever bites.
 const encPrefix = "enc1:"
+
+// A Sealer encrypts and decrypts values with the configured key. It is exported
+// because the database is not the only place prompt content comes to rest: the
+// server's shared Redis cache holds the same templates, and an "encrypted at
+// rest" guarantee that stops at one of two persistent stores is not a guarantee.
+// One implementation of the crypto, used by both.
+type Sealer struct{ aead cipher.AEAD }
+
+// NewSealer builds a Sealer from PRIOMPT_ENCRYPTION_KEY. A nil-aead Sealer (no
+// key configured) is valid and passes values through unchanged, so callers need
+// no branch of their own.
+func NewSealer() (*Sealer, error) {
+	aead, err := loadCipher()
+	if err != nil {
+		return nil, err
+	}
+	return &Sealer{aead: aead}, nil
+}
+
+// Enabled reports whether a key is configured.
+func (s *Sealer) Enabled() bool { return s != nil && s.aead != nil }
+
+// Seal encrypts a value; passthrough when no key is configured.
+func (s *Sealer) Seal(plain string) string {
+	if !s.Enabled() {
+		return plain
+	}
+	nonce := make([]byte, s.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		panic(err) // crypto/rand failure is unrecoverable
+	}
+	ct := s.aead.Seal(nonce, nonce, []byte(plain), nil)
+	return encPrefix + base64.StdEncoding.EncodeToString(ct)
+}
+
+// SealBytes is Seal for opaque binary payloads — a marshalled protobuf, say.
+func (s *Sealer) SealBytes(plain []byte) []byte {
+	if !s.Enabled() {
+		return plain
+	}
+	nonce := make([]byte, s.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		panic(err)
+	}
+	return append([]byte(encPrefix), s.aead.Seal(nonce, nonce, plain, nil)...)
+}
+
+// OpenBytes reverses SealBytes. A value without the marker is returned as-is.
+func (s *Sealer) OpenBytes(stored []byte) ([]byte, error) {
+	if !s.Enabled() || !bytes.HasPrefix(stored, []byte(encPrefix)) {
+		return stored, nil
+	}
+	ct := stored[len(encPrefix):]
+	n := s.aead.NonceSize()
+	if len(ct) < n {
+		return nil, errors.New("encrypted value too short")
+	}
+	return s.aead.Open(nil, ct[:n], ct[n:], nil)
+}
 
 // loadCipher builds the column cipher from PRIOMPT_ENCRYPTION_KEY (base64 of a
 // 32-byte key) for AES-256-GCM. Unset -> nil (plaintext storage, unchanged).
