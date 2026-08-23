@@ -567,3 +567,109 @@ func (s *Store) Get(ctx context.Context, uri string) (Prompt, error) {
 	}
 	return p, nil
 }
+
+// --- whole-store dump and load (backup / restore) --------------------------
+//
+// Dump above returns the served HEAD only — the prompts table. That is the
+// right shape for exporting content, and the wrong shape for a backup: a
+// restore built from it produces a database that serves correctly and has no
+// history at all, no branches, and no commit for main to point at. Every
+// version-control operation the product exists for is silently gone, while the
+// prompts still resolve, so the result looks healthy.
+//
+// These carry the other two tables. The split mirrors the one every comparable
+// system draws — Dolt separates `dump` from `backup`, Postgres separates
+// pg_dump from pg_basebackup plus WAL — because a logical export of current
+// state genuinely cannot reconstruct history, and pretending otherwise is how
+// people lose it.
+
+// Ref is one branch pointer: which commit a branch of a prompt points at.
+type Ref struct {
+	URI    string
+	Branch string
+	Commit string
+}
+
+// DumpCommits returns every commit in the store, oldest first so that a restore
+// can insert them in an order where each commit's parents already exist.
+func (s *Store) DumpCommits(ctx context.Context) ([]Commit, error) {
+	rows, err := s.db.QueryContext(ctx, s.rebind(commitCols+` ORDER BY created_at, hash`))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Commit
+	for rows.Next() {
+		c, err := s.scanCommit(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// DumpRefs returns every branch pointer in the store.
+func (s *Store) DumpRefs(ctx context.Context) ([]Ref, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT uri, branch, commit_hash FROM refs ORDER BY uri, branch`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Ref
+	for rows.Next() {
+		var r Ref
+		if err := rows.Scan(&r.URI, &r.Branch, &r.Commit); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// PutCommit inserts a commit verbatim, preserving its hash, parents, author,
+// message and timestamp. Restoring must not recompute the hash: the hash is the
+// commit's identity, every child names it as a parent, and recomputing would
+// break the chain. Re-inserting an existing commit is a no-op.
+func (s *Store) PutCommit(ctx context.Context, c Commit) error {
+	slotsJSON, err := json.Marshal(c.Slots)
+	if err != nil {
+		return err
+	}
+	var p, p2 any // NULL, not "", for absent parents
+	if c.Parent != "" {
+		p = c.Parent
+	}
+	if c.Parent2 != "" {
+		p2 = c.Parent2
+	}
+	created := c.CreatedAt
+	if created.IsZero() {
+		created = time.Now().UTC()
+	}
+	q := `INSERT INTO commits(hash,uri,template,slots,version_hash,parent,parent2,author,message,created_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(hash) DO NOTHING`
+	_, err = s.db.ExecContext(ctx, s.rebind(q),
+		c.Hash, c.URI, s.seal(c.Template), s.seal(string(slotsJSON)), c.VersionHash,
+		p, p2, c.Author, c.Message, created.UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+// PutRef points a branch at a commit, creating or moving it. Unlike SetBranch
+// this does not re-materialize the served HEAD or check that the commit belongs
+// to the prompt — a restore replays recorded state rather than performing a
+// rollback, and the prompts table is restored from its own records.
+func (s *Store) PutRef(ctx context.Context, r Ref) error {
+	q := `INSERT INTO refs(uri,branch,commit_hash) VALUES(?,?,?)
+		ON CONFLICT(uri,branch) DO UPDATE SET commit_hash=excluded.commit_hash`
+	_, err := s.db.ExecContext(ctx, s.rebind(q), r.URI, r.Branch, r.Commit)
+	return err
+}
+
+// CountCommits reports how many commits the store holds. Restore uses it to
+// refuse to write over a database that already has history.
+func (s *Store) CountCommits(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM commits`).Scan(&n)
+	return n, err
+}
