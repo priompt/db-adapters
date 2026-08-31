@@ -386,11 +386,13 @@ func (s *Store) commit(ctx context.Context, uri, branch, template string, slots 
 }
 
 // Branch creates a new branch pointing at the current tip of from. The new branch
-// shares from's history until they diverge.
-func (s *Store) Branch(ctx context.Context, uri, name, from string) error {
+// shares from's history until they diverge. Returns that tip's commit hash — the
+// caller already needs it and Branch has already resolved it internally, so
+// there's no reason to make them look it up again.
+func (s *Store) Branch(ctx context.Context, uri, name, from string) (string, error) {
 	src, err := s.tip(ctx, uri, from)
 	if err != nil {
-		return err
+		return "", err
 	}
 	// ON CONFLICT DO NOTHING rather than letting the unique index raise: the
 	// driver's own message ("UNIQUE constraint failed: refs.uri, refs.branch")
@@ -400,16 +402,16 @@ func (s *Store) Branch(ctx context.Context, uri, name, from string) error {
 		`INSERT INTO refs(uri,branch,commit_hash) VALUES(?,?,?) ON CONFLICT(uri,branch) DO NOTHING`),
 		uri, name, src)
 	if err != nil {
-		return err
+		return "", err
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if n == 0 {
-		return ErrAlreadyExists
+		return "", ErrAlreadyExists
 	}
-	return nil
+	return src, nil
 }
 
 // Merge records a merge commit on into, with into's tip as first parent and from's
@@ -498,22 +500,36 @@ func (s *Store) GetCommit(ctx context.Context, hash string) (Commit, error) {
 
 // Log walks the first-parent chain from a branch tip back to the root — the
 // mainline history, newest first. (Like `git log --first-parent`; second parents
-// are reachable via GetCommit when you need the full DAG.)
+// are reachable via GetCommit when you need the full DAG.) Done as one recursive
+// query rather than one round-trip per commit: a branch's history only grows,
+// and an N-round-trip walk gets slower every time something is published to it.
 func (s *Store) Log(ctx context.Context, uri, branch string) ([]Commit, error) {
 	h, err := s.tip(ctx, uri, branch)
 	if err != nil {
 		return nil, err
 	}
+	const q = `WITH RECURSIVE chain(hash,uri,template,slots,version_hash,parent,parent2,author,message,created_at,depth) AS (
+		SELECT hash,uri,template,slots,version_hash,parent,parent2,author,message,created_at,0
+			FROM commits WHERE hash=?
+		UNION ALL
+		SELECT c.hash,c.uri,c.template,c.slots,c.version_hash,c.parent,c.parent2,c.author,c.message,c.created_at,chain.depth+1
+			FROM commits c JOIN chain ON c.hash = chain.parent
+	)
+	SELECT hash,uri,template,slots,version_hash,parent,parent2,author,message,created_at FROM chain ORDER BY depth`
+	rows, err := s.db.QueryContext(ctx, s.rebind(q), h)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 	var out []Commit
-	for h != "" {
-		c, err := s.GetCommit(ctx, h)
+	for rows.Next() {
+		c, err := s.scanCommit(rows)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, c)
-		h = c.Parent
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 const commitCols = `SELECT hash,uri,template,slots,version_hash,parent,parent2,author,message,created_at FROM commits`

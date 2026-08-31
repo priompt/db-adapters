@@ -133,7 +133,7 @@ func TestCommitGraph(t *testing.T) {
 	}
 
 	// Branch off main, commit on the branch — main is untouched.
-	if err := st.Branch(ctx, uri, "feature", DefaultBranch); err != nil {
+	if _, err := st.Branch(ctx, uri, "feature", DefaultBranch); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.Commit(ctx, uri, "feature", "v3-feat", nil, "bob", "feat"); err != nil {
@@ -160,7 +160,7 @@ func TestCommitGraph(t *testing.T) {
 		t.Fatal("main tip is not the merge commit")
 	}
 
-	if err := st.Branch(ctx, uri, "x", "nope"); !errors.Is(err, ErrBranchNotFound) {
+	if _, err := st.Branch(ctx, uri, "x", "nope"); !errors.Is(err, ErrBranchNotFound) {
 		t.Fatalf("branch from missing = %v, want ErrBranchNotFound", err)
 	}
 }

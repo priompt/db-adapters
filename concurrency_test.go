@@ -249,10 +249,10 @@ func TestBranchAlreadyExists(t *testing.T) {
 	if _, err := st.Commit(ctx, uri, DefaultBranch, "x {org}.", []string{"org"}, "a", "m"); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Branch(ctx, uri, "feature", DefaultBranch); err != nil {
+	if _, err := st.Branch(ctx, uri, "feature", DefaultBranch); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Branch(ctx, uri, "feature", DefaultBranch); !errors.Is(err, ErrAlreadyExists) {
+	if _, err := st.Branch(ctx, uri, "feature", DefaultBranch); !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("duplicate branch = %v, want ErrAlreadyExists", err)
 	}
 }

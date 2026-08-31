@@ -27,7 +27,7 @@ func TestFullRoundTripPreservesHistory(t *testing.T) {
 		}
 		hashes = append(hashes, h)
 	}
-	if err := src.Branch(ctx, uri, "dev", DefaultBranch); err != nil {
+	if _, err := src.Branch(ctx, uri, "dev", DefaultBranch); err != nil {
 		t.Fatal(err)
 	}
 
