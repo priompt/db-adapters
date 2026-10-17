@@ -35,7 +35,7 @@ append-only migration steps, applied automatically and idempotently at `Open`.
 ## Using it
 
 ```go
-import store "priomptdb"
+import store "github.com/priompt/db-adapters"
 
 st, _ := store.Open("prompts.db")                  // a file path -> SQLite
 st, _ := store.Open("postgres://user:pw@host/db")  // a postgres:// DSN -> PostgreSQL
@@ -102,8 +102,7 @@ Tests run on SQLite in a temp directory — `go test ./...`, nothing to install.
 
 ## Relation to the core repo
 
-The Priompt server imports this module directly (as `priomptdb`) — there is
-one copy of the storage engine and this repo is it. During local development
-the server's `go.mod` points here with a `replace` directive; when this module
-is published under its public path, that directive is swapped for a normal
-`require`.
+The Priompt server imports this module directly (as
+`github.com/priompt/db-adapters`, a tagged version) — there is one copy of the
+storage engine and this repo is it. To change it alongside the server, use a
+`go.work` in the parent directory (`go work init ./db-adapters ./priompt`).

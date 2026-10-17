@@ -1,4 +1,4 @@
-module priomptdb
+module github.com/priompt/db-adapters
 
 go 1.25.0
 
