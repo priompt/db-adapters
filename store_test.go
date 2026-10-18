@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -162,6 +163,50 @@ func TestCommitGraph(t *testing.T) {
 
 	if _, err := st.Branch(ctx, uri, "x", "nope"); !errors.Is(err, ErrBranchNotFound) {
 		t.Fatalf("branch from missing = %v, want ErrBranchNotFound", err)
+	}
+}
+
+func TestBranchesAndCommits(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "b.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	const uri = "priompt://o/r/p"
+
+	c1, _ := st.Commit(ctx, uri, DefaultBranch, "v1", nil, "ann", "init")
+	c2, _ := st.Commit(ctx, uri, DefaultBranch, "v2", nil, "ann", "edit")
+	if _, err := st.Branch(ctx, uri, "feature-x", DefaultBranch); err != nil {
+		t.Fatal(err)
+	}
+	c3, _ := st.Commit(ctx, uri, "feature-x", "v3", nil, "bob", "feat")
+	st.Commit(ctx, "priompt://o/r/other", DefaultBranch, "v1", nil, "ann", "init") // another prompt
+
+	// Roll main back to c1: c2 is no longer on any branch, but still listed.
+	if _, err := st.SetBranch(ctx, uri, DefaultBranch, c1); err != nil {
+		t.Fatal(err)
+	}
+	refs, err := st.Branches(ctx, uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 2 || refs[0].Branch != "feature-x" || refs[0].Commit != c3 || refs[1].Branch != DefaultBranch || refs[1].Commit != c1 {
+		t.Fatalf("branches = %+v, want feature-x@c3, main@c1", refs)
+	}
+	all, err := st.Commits(ctx, uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range all {
+		got = append(got, c.Hash)
+	}
+	if want := []string{c3, c2, c1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("commits = %v, want newest first %v", got, want)
+	}
+	if refs, _ := st.Branches(ctx, "priompt://o/r/none"); len(refs) != 0 {
+		t.Fatalf("branches of unknown prompt = %+v, want none", refs)
 	}
 }
 

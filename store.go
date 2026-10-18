@@ -516,7 +516,60 @@ func (s *Store) Log(ctx context.Context, uri, branch string) ([]Commit, error) {
 			FROM commits c JOIN chain ON c.hash = chain.parent
 	)
 	SELECT hash,uri,template,slots,version_hash,parent,parent2,author,message,created_at FROM chain ORDER BY depth`
-	rows, err := s.db.QueryContext(ctx, s.rebind(q), h)
+	return s.queryCommits(ctx, q, h)
+}
+
+// Commits returns every commit of a prompt, newest first — on any branch, a
+// merged-away side branch, or none at all (a commit left behind by a rollback).
+// Log only follows one branch's first parents, so it can't reach those.
+func (s *Store) Commits(ctx context.Context, uri string) ([]Commit, error) {
+	cs, err := s.queryCommits(ctx, commitCols+` WHERE uri=? ORDER BY hash`, uri)
+	if err != nil {
+		return nil, err
+	}
+	return newestFirst(cs), nil
+}
+
+// newestFirst orders commits like `git log --date-order`: never a parent before
+// its child, otherwise newest first. Timestamps alone aren't enough — commits
+// made within one clock tick tie, and created_at is RFC3339Nano text with
+// trailing zeros trimmed, so it doesn't sort lexically in SQL either.
+// ponytail: O(n²) over one prompt's commits; use a heap if a prompt ever has thousands.
+func newestFirst(cs []Commit) []Commit {
+	children := map[string]int{} // unplaced children per commit
+	for _, c := range cs {
+		children[c.Parent]++
+		if c.Parent2 != "" {
+			children[c.Parent2]++
+		}
+	}
+	placed := make([]bool, len(cs))
+	out := make([]Commit, 0, len(cs))
+	for len(out) < len(cs) {
+		best := -1
+		for i, c := range cs {
+			if !placed[i] && children[c.Hash] == 0 && (best < 0 || c.CreatedAt.After(cs[best].CreatedAt)) {
+				best = i
+			}
+		}
+		c := cs[best] // always found: the commit graph is acyclic
+		placed[best] = true
+		out = append(out, c)
+		children[c.Parent]--
+		if c.Parent2 != "" {
+			children[c.Parent2]--
+		}
+	}
+	return out
+}
+
+// Branches returns a prompt's branch pointers, sorted by name.
+func (s *Store) Branches(ctx context.Context, uri string) ([]Ref, error) {
+	return s.queryRefs(ctx, s.rebind(`SELECT uri, branch, commit_hash FROM refs WHERE uri=? ORDER BY branch`), uri)
+}
+
+func (s *Store) queryCommits(ctx context.Context, q string, args ...any) ([]Commit, error) {
+	rows, err := s.db.QueryContext(ctx, s.rebind(q), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -609,25 +662,16 @@ type Ref struct {
 // DumpCommits returns every commit in the store, oldest first so that a restore
 // can insert them in an order where each commit's parents already exist.
 func (s *Store) DumpCommits(ctx context.Context) ([]Commit, error) {
-	rows, err := s.db.QueryContext(ctx, s.rebind(commitCols+` ORDER BY created_at, hash`))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Commit
-	for rows.Next() {
-		c, err := s.scanCommit(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
+	return s.queryCommits(ctx, commitCols+` ORDER BY created_at, hash`)
 }
 
 // DumpRefs returns every branch pointer in the store.
 func (s *Store) DumpRefs(ctx context.Context) ([]Ref, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT uri, branch, commit_hash FROM refs ORDER BY uri, branch`)
+	return s.queryRefs(ctx, `SELECT uri, branch, commit_hash FROM refs ORDER BY uri, branch`)
+}
+
+func (s *Store) queryRefs(ctx context.Context, q string, args ...any) ([]Ref, error) {
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
