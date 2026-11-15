@@ -32,7 +32,7 @@ const encPrefixBound = "enc2:"
 
 // promptAAD and commitAAD bind a sealed column to its row: a prompts row by
 // URI, a commits row by commit hash (which itself covers URI and content).
-func promptAAD(uri, column string) string   { return "prompts\x00" + uri + "\x00" + column }
+func promptAAD(uri, column string) string  { return "prompts\x00" + uri + "\x00" + column }
 func commitAAD(hash, column string) string { return "commits\x00" + hash + "\x00" + column }
 
 // A Sealer encrypts and decrypts values with the configured key. It is exported
@@ -140,6 +140,12 @@ func (s *Store) seal(plain, aad string) string {
 // is opened without associated data.
 func (s *Store) open(stored, aad string) (string, error) {
 	if s.aead == nil {
+		// No key here, but a marked value means the row was written encrypted.
+		// Returning it would pass ciphertext off as the prompt, so say what is
+		// actually wrong instead. Both markers count: every new write is enc2.
+		if strings.HasPrefix(stored, encPrefixBound) || strings.HasPrefix(stored, encPrefix) {
+			return "", ErrEncryptionKeyMissing
+		}
 		return stored, nil
 	}
 	var body string

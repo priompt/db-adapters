@@ -64,6 +64,12 @@ type Prompt struct {
 
 var ErrNotFound = errors.New("prompt not found")
 
+// ErrEncryptionKeyMissing is returned when a row was written with
+// PRIOMPT_ENCRYPTION_KEY set and this process has none. Without it the store
+// handed back the ciphertext as if it were the prompt, and every reader failed
+// later on a JSON error from decoding the encrypted `slots` column.
+var ErrEncryptionKeyMissing = errors.New("row is encrypted but PRIOMPT_ENCRYPTION_KEY is not set")
+
 type Store struct {
 	db       *sql.DB
 	d        dialect
