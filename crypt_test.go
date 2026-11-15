@@ -39,10 +39,10 @@ func TestEncryptionRoundTrip(t *testing.T) {
 	if err := st.db.QueryRow(`SELECT template, slots FROM prompts WHERE uri=?`, uri).Scan(&rawT, &rawS); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(rawT, encPrefix) || strings.Contains(rawT, "secret") {
+	if !strings.HasPrefix(rawT, encPrefixBound) || strings.Contains(rawT, "secret") {
 		t.Errorf("template stored in the clear: %q", rawT)
 	}
-	if !strings.HasPrefix(rawS, encPrefix) || strings.Contains(rawS, "name") {
+	if !strings.HasPrefix(rawS, encPrefixBound) || strings.Contains(rawS, "name") {
 		t.Errorf("slots stored in the clear: %q", rawS)
 	}
 }

@@ -22,6 +22,19 @@ import (
 // marker to its own column if it ever bites.
 const encPrefix = "enc1:"
 
+// encPrefixBound marks a column value sealed with associated data naming its
+// row and column (see promptAAD, commitAAD). AES-GCM authenticates the
+// associated data, so a ciphertext copied into another row or column fails to
+// decrypt instead of serving another prompt's content. New writes always use
+// it; enc1 values (no associated data) stay readable so existing databases
+// keep working, and a backup + restore re-seals them in this format.
+const encPrefixBound = "enc2:"
+
+// promptAAD and commitAAD bind a sealed column to its row: a prompts row by
+// URI, a commits row by commit hash (which itself covers URI and content).
+func promptAAD(uri, column string) string   { return "prompts\x00" + uri + "\x00" + column }
+func commitAAD(hash, column string) string { return "commits\x00" + hash + "\x00" + column }
+
 // A Sealer encrypts and decrypts values with the configured key. It is exported
 // because the database is not the only place prompt content comes to rest: the
 // server's shared Redis cache holds the same templates, and an "encrypted at
@@ -104,11 +117,12 @@ func loadCipher() (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
-// seal encrypts a column value — a random nonce is prepended to the ciphertext,
-// the whole thing base64'd and marked. Passthrough when no key is configured.
-// Non-deterministic (fresh nonce each call), which is fine: identity and dedup
-// key off version_hash, computed over plaintext, never the stored column.
-func (s *Store) seal(plain string) string {
+// seal encrypts a column value bound to aad (its row and column) — a random
+// nonce is prepended to the ciphertext, the whole thing base64'd and marked.
+// Passthrough when no key is configured. Non-deterministic (fresh nonce each
+// call), which is fine: identity and dedup key off version_hash, computed over
+// plaintext, never the stored column.
+func (s *Store) seal(plain, aad string) string {
 	if s.aead == nil {
 		return plain
 	}
@@ -116,17 +130,29 @@ func (s *Store) seal(plain string) string {
 	if _, err := rand.Read(nonce); err != nil {
 		panic(err) // crypto/rand failure is unrecoverable
 	}
-	ct := s.aead.Seal(nonce, nonce, []byte(plain), nil)
-	return encPrefix + base64.StdEncoding.EncodeToString(ct)
+	ct := s.aead.Seal(nonce, nonce, []byte(plain), []byte(aad))
+	return encPrefixBound + base64.StdEncoding.EncodeToString(ct)
 }
 
-// open reverses seal. A value without the marker is plaintext (a pre-key row, or
-// no key configured) and returned unchanged.
-func (s *Store) open(stored string) (string, error) {
-	if s.aead == nil || !strings.HasPrefix(stored, encPrefix) {
+// open reverses seal; aad must name the row and column the value was read
+// from. A value without a marker is plaintext (a pre-key row, or no key
+// configured) and returned unchanged; an enc1 value predates row binding and
+// is opened without associated data.
+func (s *Store) open(stored, aad string) (string, error) {
+	if s.aead == nil {
 		return stored, nil
 	}
-	ct, err := base64.StdEncoding.DecodeString(stored[len(encPrefix):])
+	var body string
+	var ad []byte
+	switch {
+	case strings.HasPrefix(stored, encPrefixBound):
+		body, ad = stored[len(encPrefixBound):], []byte(aad)
+	case strings.HasPrefix(stored, encPrefix):
+		body = stored[len(encPrefix):]
+	default:
+		return stored, nil
+	}
+	ct, err := base64.StdEncoding.DecodeString(body)
 	if err != nil {
 		return "", err
 	}
@@ -134,7 +160,7 @@ func (s *Store) open(stored string) (string, error) {
 	if len(ct) < n {
 		return "", errors.New("encrypted column too short")
 	}
-	plain, err := s.aead.Open(nil, ct[:n], ct[n:], nil)
+	plain, err := s.aead.Open(nil, ct[:n], ct[n:], ad)
 	if err != nil {
 		return "", fmt.Errorf("decrypt column: %w", err)
 	}
