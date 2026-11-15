@@ -174,10 +174,10 @@ func (s *Store) dumpPrompts(ctx context.Context, q querier) ([]Prompt, error) {
 		if err := rows.Scan(&p.URI, &p.Template, &slots, &p.VersionHash); err != nil {
 			return nil, err
 		}
-		if p.Template, err = s.open(p.Template); err != nil {
+		if p.Template, err = s.open(p.Template, promptAAD(p.URI, "template")); err != nil {
 			return nil, err
 		}
-		if slots, err = s.open(slots); err != nil {
+		if slots, err = s.open(slots, promptAAD(p.URI, "slots")); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(slots), &p.Slots); err != nil {
@@ -232,7 +232,8 @@ func (s *Store) Put(ctx context.Context, p Prompt) error {
 		return err
 	}
 	p.VersionHash = Hash(p.Template, p.Slots)
-	_, err = s.db.ExecContext(ctx, s.putQuery, p.URI, s.seal(p.Template), s.seal(string(slots)), p.VersionHash)
+	_, err = s.db.ExecContext(ctx, s.putQuery, p.URI,
+		s.seal(p.Template, promptAAD(p.URI, "template")), s.seal(string(slots), promptAAD(p.URI, "slots")), p.VersionHash)
 	return err
 }
 
@@ -326,7 +327,7 @@ func (s *Store) commit(ctx context.Context, uri, branch, template string, slots 
 	}
 	vh := Hash(template, slots)
 	hash := CommitHash(uri, vh, parent, parent2, author, message)
-	encT, encSlots := s.seal(template), s.seal(string(slotsJSON))
+	encT, encSlots := s.seal(template, commitAAD(hash, "template")), s.seal(string(slotsJSON), commitAAD(hash, "slots"))
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -388,7 +389,8 @@ func (s *Store) commit(ctx context.Context, uri, branch, template string, slots 
 	// The prompts table is the materialized tip of the trunk — the served HEAD.
 	// Keep it in sync whenever a commit (or merge) moves main, in the same tx.
 	if branch == DefaultBranch {
-		if _, err := tx.ExecContext(ctx, s.putQuery, uri, encT, encSlots, vh); err != nil {
+		if _, err := tx.ExecContext(ctx, s.putQuery, uri,
+			s.seal(template, promptAAD(uri, "template")), s.seal(string(slotsJSON), promptAAD(uri, "slots")), vh); err != nil {
 			return "", err
 		}
 	}
@@ -496,7 +498,8 @@ func (s *Store) SetBranch(ctx context.Context, uri, branch, commitHash string) (
 		if err != nil {
 			return Commit{}, err
 		}
-		if _, err := tx.ExecContext(ctx, s.putQuery, uri, s.seal(c.Template), s.seal(string(slotsJSON)), c.VersionHash); err != nil {
+		if _, err := tx.ExecContext(ctx, s.putQuery, uri,
+			s.seal(c.Template, promptAAD(uri, "template")), s.seal(string(slotsJSON), promptAAD(uri, "slots")), c.VersionHash); err != nil {
 			return Commit{}, err
 		}
 	}
@@ -611,10 +614,10 @@ func (s *Store) scanCommit(row rowScanner) (Commit, error) {
 		return c, err
 	}
 	c.Parent, c.Parent2 = parent.String, parent2.String
-	if c.Template, err = s.open(c.Template); err != nil {
+	if c.Template, err = s.open(c.Template, commitAAD(c.Hash, "template")); err != nil {
 		return c, err
 	}
-	if slots, err = s.open(slots); err != nil {
+	if slots, err = s.open(slots, commitAAD(c.Hash, "slots")); err != nil {
 		return c, err
 	}
 	if err := json.Unmarshal([]byte(slots), &c.Slots); err != nil {
@@ -635,10 +638,10 @@ func (s *Store) Get(ctx context.Context, uri string) (Prompt, error) {
 	if err != nil {
 		return p, err
 	}
-	if p.Template, err = s.open(p.Template); err != nil {
+	if p.Template, err = s.open(p.Template, promptAAD(p.URI, "template")); err != nil {
 		return p, err
 	}
-	if slots, err = s.open(slots); err != nil {
+	if slots, err = s.open(slots, promptAAD(p.URI, "slots")); err != nil {
 		return p, err
 	}
 	if err := json.Unmarshal([]byte(slots), &p.Slots); err != nil {
@@ -756,7 +759,7 @@ func (s *Store) PutCommit(ctx context.Context, c Commit) error {
 	q := `INSERT INTO commits(hash,uri,template,slots,version_hash,parent,parent2,author,message,created_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(hash) DO NOTHING`
 	_, err = s.db.ExecContext(ctx, s.rebind(q),
-		c.Hash, c.URI, s.seal(c.Template), s.seal(string(slotsJSON)), c.VersionHash,
+		c.Hash, c.URI, s.seal(c.Template, commitAAD(c.Hash, "template")), s.seal(string(slotsJSON), commitAAD(c.Hash, "slots")), c.VersionHash,
 		p, p2, c.Author, c.Message, created.UTC().Format(time.RFC3339Nano))
 	return err
 }
