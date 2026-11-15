@@ -65,6 +65,9 @@ file, a Postgres dump) gets ciphertext. The honest fine print:
   so caching and deduplication keep working.
 - **Lose the key and encrypted rows are unrecoverable.** Every process that
   opens the same database must share the key.
+- **A process without the key can tell.** Reading an encrypted row without
+  `PRIOMPT_ENCRYPTION_KEY` returns `ErrEncryptionKeyMissing` instead of the
+  stored ciphertext, so a forgotten key on one node or a cron job says so.
 
 ## How the pluggable-backend part works
 
