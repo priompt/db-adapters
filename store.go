@@ -150,9 +150,19 @@ func migrate(db *sql.DB, d dialect) (int, error) {
 	return cur, nil
 }
 
-// Dump returns every stored prompt, ordered by URI — the backup snapshot.
+// querier is a *sql.DB or a *sql.Tx, so the read helpers can run inside
+// Snapshot's transaction or on their own.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// Dump returns every stored prompt, ordered by URI.
 func (s *Store) Dump(ctx context.Context) ([]Prompt, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT uri, template, slots, version_hash FROM prompts ORDER BY uri`)
+	return s.dumpPrompts(ctx, s.db)
+}
+
+func (s *Store) dumpPrompts(ctx context.Context, q querier) ([]Prompt, error) {
+	rows, err := q.QueryContext(ctx, `SELECT uri, template, slots, version_hash FROM prompts ORDER BY uri`)
 	if err != nil {
 		return nil, err
 	}
@@ -516,14 +526,14 @@ func (s *Store) Log(ctx context.Context, uri, branch string) ([]Commit, error) {
 			FROM commits c JOIN chain ON c.hash = chain.parent
 	)
 	SELECT hash,uri,template,slots,version_hash,parent,parent2,author,message,created_at FROM chain ORDER BY depth`
-	return s.queryCommits(ctx, q, h)
+	return s.queryCommits(ctx, s.db, q, h)
 }
 
 // Commits returns every commit of a prompt, newest first — on any branch, a
 // merged-away side branch, or none at all (a commit left behind by a rollback).
 // Log only follows one branch's first parents, so it can't reach those.
 func (s *Store) Commits(ctx context.Context, uri string) ([]Commit, error) {
-	cs, err := s.queryCommits(ctx, commitCols+` WHERE uri=? ORDER BY hash`, uri)
+	cs, err := s.queryCommits(ctx, s.db, commitCols+` WHERE uri=? ORDER BY hash`, uri)
 	if err != nil {
 		return nil, err
 	}
@@ -565,11 +575,11 @@ func newestFirst(cs []Commit) []Commit {
 
 // Branches returns a prompt's branch pointers, sorted by name.
 func (s *Store) Branches(ctx context.Context, uri string) ([]Ref, error) {
-	return s.queryRefs(ctx, s.rebind(`SELECT uri, branch, commit_hash FROM refs WHERE uri=? ORDER BY branch`), uri)
+	return s.queryRefs(ctx, s.db, s.rebind(`SELECT uri, branch, commit_hash FROM refs WHERE uri=? ORDER BY branch`), uri)
 }
 
-func (s *Store) queryCommits(ctx context.Context, q string, args ...any) ([]Commit, error) {
-	rows, err := s.db.QueryContext(ctx, s.rebind(q), args...)
+func (s *Store) queryCommits(ctx context.Context, db querier, q string, args ...any) ([]Commit, error) {
+	rows, err := db.QueryContext(ctx, s.rebind(q), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -662,16 +672,52 @@ type Ref struct {
 // DumpCommits returns every commit in the store, oldest first so that a restore
 // can insert them in an order where each commit's parents already exist.
 func (s *Store) DumpCommits(ctx context.Context) ([]Commit, error) {
-	return s.queryCommits(ctx, commitCols+` ORDER BY created_at, hash`)
+	return s.queryCommits(ctx, s.db, dumpCommitsQuery)
 }
 
 // DumpRefs returns every branch pointer in the store.
 func (s *Store) DumpRefs(ctx context.Context) ([]Ref, error) {
-	return s.queryRefs(ctx, `SELECT uri, branch, commit_hash FROM refs ORDER BY uri, branch`)
+	return s.queryRefs(ctx, s.db, dumpRefsQuery)
 }
 
-func (s *Store) queryRefs(ctx context.Context, q string, args ...any) ([]Ref, error) {
-	rows, err := s.db.QueryContext(ctx, q, args...)
+const (
+	dumpCommitsQuery = commitCols + ` ORDER BY created_at, hash`
+	dumpRefsQuery    = `SELECT uri, branch, commit_hash FROM refs ORDER BY uri, branch`
+)
+
+// Snapshot returns prompts, commits and refs as of one moment, read in a single
+// transaction. Calling Dump, DumpCommits and DumpRefs separately against a live
+// store is not a backup: a publish landing between them yields a ref naming a
+// commit the dump does not contain, or a served prompt with no commit behind it.
+// SQLite (WAL) pins a read snapshot for the transaction; Postgres needs
+// REPEATABLE READ to do the same.
+func (s *Store) Snapshot(ctx context.Context) ([]Prompt, []Commit, []Ref, error) {
+	opts := &sql.TxOptions{ReadOnly: true}
+	if s.d.driver == postgres.driver {
+		opts.Isolation = sql.LevelRepeatableRead
+	}
+	tx, err := s.db.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer tx.Rollback() // read-only: nothing to commit
+	prompts, err := s.dumpPrompts(ctx, tx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	commits, err := s.queryCommits(ctx, tx, dumpCommitsQuery)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	refs, err := s.queryRefs(ctx, tx, dumpRefsQuery)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return prompts, commits, refs, nil
+}
+
+func (s *Store) queryRefs(ctx context.Context, db querier, q string, args ...any) ([]Ref, error) {
+	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
